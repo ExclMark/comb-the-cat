@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Comb the Cat</title>
+<link rel="icon" type="image/png" href="favicon.png">
+<link rel="apple-touch-icon" href="favicon.png">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; overscroll-behavior: none; background: #fff; font-family: system-ui, sans-serif; }
+  body { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  * { cursor: none; }
+  #play { position: fixed; inset: 0; display: grid; place-items: center; touch-action: none; user-select: none; -webkit-user-select: none; }
+  #cat { height: 90vh; height: 90dvh; max-width: 95vw; object-fit: contain; -webkit-user-drag: none; transform-origin: 50% 100%; animation: breathe 3s ease-in-out infinite alternate; }
+  @keyframes breathe { to { transform: scale(1.008, 1.018); } }
+  @media (prefers-reduced-motion: reduce) { #cat { animation: none; } }
+  .hair { position: fixed; z-index: 4; pointer-events: none; filter: drop-shadow(0 0 0.5px rgba(0,0,0,.35)); }
+  .hair svg { display: block; }
+  #score { position: fixed; top: 2vmin; left: 3vmin; pointer-events: none; color: #ddd; line-height: 1; }
+  #points { font-size: 15vmin; font-weight: 700; }
+  #best { font-size: 3.5vmin; color: #bbb; }
+  #scare { position: fixed; display: none; object-fit: cover; pointer-events: none; z-index: 5; }
+  #hint { position: fixed; bottom: calc(16px + env(safe-area-inset-bottom)); left: 16px; right: 16px; text-align: center; color: #bbb; font-size: clamp(12px, 3.5vmin, 18px); pointer-events: none; }
+  #death { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .8em;
+           padding: 16px; text-align: center; background: #000; color: #888; font-size: clamp(14px, 2.6vmin, 22px); user-select: none; -webkit-user-select: none;
+           touch-action: none; opacity: 0; visibility: hidden; pointer-events: none; }
+  /* Transitions live only on .shown so removing the class hides instantly (no fade out). */
+  #death.shown { opacity: 1; visibility: visible; pointer-events: auto; transition: opacity var(--fade) ease-in; }
+  #death-title { opacity: 0; color: #a3120f; font: clamp(40px, 12vmin, 140px) "Times New Roman", Georgia, serif; text-transform: uppercase; letter-spacing: .1em; text-shadow: 0 0 .15em rgba(163,18,15,.45); }
+  #death.shown #death-title { opacity: 1; transition: opacity calc(var(--fade) / 2) ease-in calc(var(--fade) / 2); }
+  #death-cta { font-size: .75em; color: #555; }
+  #comb { position: fixed; left: 0; top: 0; z-index: 20; pointer-events: none; display: none; transform: translate(-50%, -100%) rotate(-12deg); transform-origin: 50% 100%; }
+</style>
+</head>
+<body>
+<div id="play"><img id="cat" alt="cat" draggable="false"></div>
+<div id="score"><div id="points">0</div><div id="best">Best 0</div></div>
+<img id="scare" alt="" draggable="false">
+<div id="hint">Hold and drag to comb the cat. Stop when it looks!</div>
+<div id="death"><div id="death-title">You died</div><div id="death-score"></div><div id="death-cta">Tap or click to try again</div></div>
+<div id="comb">
+  <svg width="120" height="44" viewBox="0 0 120 44" aria-hidden="true">
+    <rect x="2" y="2" width="116" height="14" rx="5" fill="#222"/>
+    <g fill="#222" id="teeth"></g>
+  </svg>
+</div>
+<script>
+'use strict';
+const IMG_AWAY = 'cat-away.png';
+const IMG_LOOK = 'cat-look.png';
+const IMG_SCARE = 'cat-scare.jpg';
+const SOUND_TURN = 'vine-boom.mp3';
+const SOUND_SCARE = 'roar.mp3';
+const AWAY_MIN_MS = 1500, AWAY_MAX_MS = 5000;
+const SUDDEN_LOOK_CHANCE = 0.25;
+const SUDDEN_AWAY_MIN_MS = 300, SUDDEN_AWAY_MAX_MS = 800;
+const LOOK_MIN_MS = 800, LOOK_MAX_MS = 2000;
+// Grace window: a player mid-stroke can't physically react to the swap instantly, so early moves are forgiven.
+const GRACE_MS = 400;
+const SCARE_DELAY_CHANCE = 0.5;
+const SCARE_DELAY_MIN_MS = 700, SCARE_DELAY_MAX_MS = 2500;
+const SCARE_ZOOM_MS = 350;
+const SCARE_OVERLAY_DELAY_MS = 1000;
+const DEATH_FADE_MS = 1200;
+const PX_PER_POINT = 25;
+const BEST_KEY = 'catComb.best';
+const HAIR_EVERY_PX = 14;
+const MAX_HAIRS = 80;
+
+const playArea = document.getElementById('play');
+const catImg = document.getElementById('cat');
+const scareImg = document.getElementById('scare');
+const pointsEl = document.getElementById('points');
+const bestEl = document.getElementById('best');
+const hint = document.getElementById('hint');
+const death = document.getElementById('death');
+const deathScore = document.getElementById('death-score');
+const comb = document.getElementById('comb');
+
+for (let x = 6; x <= 112; x += 6) {
+  const tooth = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+  Object.entries({ x, y: 14, width: 3, height: 28, rx: 1.5 }).forEach(([k, v]) => tooth.setAttribute(k, v));
+  document.getElementById('teeth').appendChild(tooth);
+}
+
+function placeholderSrc(name) {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="400" height="400"><rect x="4" y="4" width="392" height="392" fill="#fafafa" stroke="#999" stroke-width="4" stroke-dasharray="12 8"/><text x="200" y="205" font-family="sans-serif" font-size="22" text-anchor="middle" fill="#666">missing ${name}</text></svg>`;
+  return 'data:image/svg+xml,' + encodeURIComponent(svg);
+}
+
+const images = {};
+for (const name of [IMG_AWAY, IMG_LOOK, IMG_SCARE]) {
+  const img = new Image();
+  img.onerror = () => {
+    console.warn(`Failed to load image: ${name}`);
+    img.onerror = null;
+    img.src = placeholderSrc(name);
+    for (const el of [catImg, scareImg]) if (el.dataset.name === name) el.src = img.src;
+  };
+  img.src = name;
+  images[name] = img;
+}
+
+// Web Audio with pre-decoded buffers: HTMLAudioElement plays late or not at all on mobile (iOS especially).
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+function bufferPlayer(buffer) {
+  let source = null;
+  return {
+    play() {
+      if (source) source.stop();
+      const s = source = audioCtx.createBufferSource();
+      s.buffer = buffer;
+      s.connect(audioCtx.destination);
+      s.onended = () => { if (source === s) source = null; };
+      s.start(0);
+    },
+    stop() { if (source) { source.stop(); source = null; } },
+    isPlaying: () => source !== null && audioCtx.state === 'running',
+  };
+}
+function htmlPlayer(name) {
+  const audio = new Audio(name);
+  audio.addEventListener('error', () => console.warn(`Failed to load audio: ${name}`));
+  return {
+    play() { audio.currentTime = 0; audio.play().catch(err => console.warn(`Audio play failed (${name}):`, err)); },
+    stop() { audio.pause(); },
+    isPlaying: () => !audio.paused,
+  };
+}
+// Null until loaded. fetch() fails for file:// pages in Chrome, hence the <audio> fallback.
+const sounds = {};
+for (const name of [SOUND_TURN, SOUND_SCARE]) {
+  sounds[name] = null;
+  fetch(name)
+    .then(res => { if (!res.ok) throw new Error(`HTTP ${res.status}`); return res.arrayBuffer(); })
+    .then(data => audioCtx.decodeAudioData(data))
+    .then(buffer => { sounds[name] = bufferPlayer(buffer); })
+    .catch(err => { console.warn(`Web Audio load failed (${name}), using <audio> fallback:`, err); sounds[name] = htmlPlayer(name); });
+}
+
+let state = 'start';
+let stateTimer = null;
+let lookStart = 0;
+let deathReady = false;
+let totalDistance = 0;
+let down = false;
+let lastX = 0, lastY = 0;
+let hairDistance = 0, liveHairs = 0;
+
+function readBest() {
+  try { return Number(localStorage.getItem(BEST_KEY)) || 0; }
+  catch (err) { console.warn(`localStorage read failed (${BEST_KEY}):`, err); return 0; }
+}
+function writeBest(value) {
+  try { localStorage.setItem(BEST_KEY, String(value)); }
+  catch (err) { console.warn(`localStorage write failed (${BEST_KEY}=${value}):`, err); }
+}
+let best = readBest();
+
+const score = () => Math.floor(totalDistance / PX_PER_POINT);
+function renderScore() {
+  pointsEl.textContent = score();
+  bestEl.textContent = `Best ${best}`;
+}
+
+function showImage(el, name) {
+  el.dataset.name = name;
+  el.src = images[name].src;
+}
+
+const randomBetween = (min, max) => min + Math.random() * (max - min);
+function schedule(fn, delayMs) {
+  clearTimeout(stateTimer);
+  stateTimer = setTimeout(fn, delayMs);
+}
+
+function enterStart() {
+  state = 'start';
+  clearTimeout(stateTimer);
+  showImage(catImg, IMG_AWAY);
+  hint.hidden = false;
+}
+function enterAway() {
+  state = 'away';
+  showImage(catImg, IMG_AWAY);
+  const sudden = Math.random() < SUDDEN_LOOK_CHANCE;
+  schedule(enterLook, sudden ? randomBetween(SUDDEN_AWAY_MIN_MS, SUDDEN_AWAY_MAX_MS) : randomBetween(AWAY_MIN_MS, AWAY_MAX_MS));
+}
+function enterLook() {
+  state = 'look';
+  lookStart = performance.now();
+  showImage(catImg, IMG_LOOK);
+  playSound(SOUND_TURN);
+  schedule(enterAway, randomBetween(LOOK_MIN_MS, LOOK_MAX_MS));
+}
+
+function resumeAudio() {
+  if (audioCtx.state !== 'running') audioCtx.resume().catch(err => console.warn(`AudioContext resume failed (${audioCtx.state}):`, err));
+}
+function playSound(name) {
+  resumeAudio();
+  sounds[name]?.play();
+}
+function stopSound(name) { sounds[name]?.stop(); }
+function isPlaying(name) { return !!sounds[name]?.isPlaying(); }
+
+function showScare() {
+  const rect = catImg.getBoundingClientRect();
+  showImage(scareImg, IMG_SCARE);
+  Object.assign(scareImg.style, { transition: 'none', display: 'block',
+    top: rect.top + 'px', left: rect.left + 'px', width: rect.width + 'px', height: rect.height + 'px' });
+  scareImg.getBoundingClientRect(); // force layout so the start rect is committed before transitioning
+  requestAnimationFrame(() => Object.assign(scareImg.style, {
+    transition: `all ${SCARE_ZOOM_MS}ms ease-out`, top: '0px', left: '0px', width: '100%', height: '100%' }));
+}
+
+function catchPlayer() {
+  state = 'caught';
+  clearTimeout(stateTimer);
+  down = false;
+  if (score() > best) { best = score(); writeBest(best); }
+  renderScore();
+  if (Math.random() < SCARE_DELAY_CHANCE) schedule(lose, randomBetween(SCARE_DELAY_MIN_MS, SCARE_DELAY_MAX_MS));
+  else lose();
+}
+
+function lose() {
+  state = 'lost';
+  clearTimeout(stateTimer);
+  down = false;
+  showScare();
+  stopSound(SOUND_TURN);
+  playSound(SOUND_SCARE);
+  if (score() > best) { best = score(); writeBest(best); }
+  renderScore();
+  schedule(() => {
+    deathScore.textContent = `Score ${score()} · Best ${best}`;
+    death.classList.add('shown');
+    schedule(() => { deathReady = true; }, DEATH_FADE_MS);
+  }, SCARE_OVERLAY_DELAY_MS);
+}
+
+// Browsers start the AudioContext suspended until a user gesture; older iOS also needs a sound started inside one.
+// Kept permanently: iOS re-suspends ('interrupted'/'suspended') after app switches or calls, and may not
+// treat pointerdown as a gesture, hence pointerup/touchend too.
+function unlockAudio() {
+  if (audioCtx.state === 'running') return;
+  resumeAudio();
+  const silent = audioCtx.createBufferSource();
+  silent.buffer = audioCtx.createBuffer(1, 1, audioCtx.sampleRate);
+  silent.connect(audioCtx.destination);
+  silent.start(0);
+}
+for (const type of ['pointerdown', 'pointerup', 'touchend']) window.addEventListener(type, unlockAudio, { passive: true });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') resumeAudio(); });
+
+death.addEventListener('pointerup', () => {
+  if (state !== 'lost' || !deathReady) return;
+  deathReady = false;
+  death.classList.remove('shown');
+  scareImg.style.display = 'none';
+  stopSound(SOUND_SCARE);
+  totalDistance = 0;
+  down = false;
+  renderScore();
+  enterStart();
+});
+
+function isInsideCat(x, y) {
+  const r = catImg.getBoundingClientRect();
+  return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+}
+
+function spawnHair(x, y) {
+  if (liveHairs >= MAX_HAIRS) return;
+  liveHairs++;
+  const len = randomBetween(14, 34), bend = randomBetween(-4, 4);
+  const hair = document.createElement('div');
+  hair.className = 'hair';
+  hair.innerHTML = `<svg width="10" height="${len}" viewBox="-5 0 10 ${len}"><path d="M0 0Q${bend} ${len / 2} 0 ${len}" fill="none" stroke="#f1dcb8" stroke-width="1.2" stroke-linecap="round"/></svg>`;
+  Object.assign(hair.style, { left: x - 5 + 'px', top: y + 'px' });
+  document.body.appendChild(hair);
+  const rot = randomBetween(-60, 60);
+  hair.animate([
+    { transform: `rotate(${rot}deg)`, opacity: 1 },
+    { transform: `translate(${randomBetween(-40, 40)}px, ${randomBetween(120, 260)}px) rotate(${rot + randomBetween(-90, 90)}deg)`, opacity: 0 },
+  ], { duration: randomBetween(900, 1500), easing: 'ease-in' }).onfinish = () => { hair.remove(); liveHairs--; };
+}
+
+function onCombMove(distance) {
+  if (state === 'start') { hint.hidden = true; enterAway(); }
+  if (state === 'away') {
+    totalDistance += distance;
+    renderScore();
+    hairDistance += distance;
+    while (hairDistance >= HAIR_EVERY_PX) { hairDistance -= HAIR_EVERY_PX; spawnHair(lastX, lastY); }
+  } else if (state === 'look' && performance.now() - lookStart >= GRACE_MS) {
+    catchPlayer();
+  }
+}
+
+playArea.addEventListener('pointerdown', e => {
+  down = true;
+  lastX = e.clientX; lastY = e.clientY;
+  playArea.setPointerCapture(e.pointerId);
+  if (e.pointerType === 'touch') comb.style.display = 'block';
+});
+playArea.addEventListener('pointermove', e => {
+  if (!down) return;
+  const distance = Math.hypot(e.clientX - lastX, e.clientY - lastY);
+  lastX = e.clientX; lastY = e.clientY;
+  if (isInsideCat(e.clientX, e.clientY)) onCombMove(distance);
+});
+function endStroke(e) {
+  down = false;
+  if (e.pointerType === 'touch') comb.style.display = 'none';
+}
+// Window-level so a touch comb never stays stuck visible when the finger lifts outside #play.
+window.addEventListener('pointerup', endStroke);
+window.addEventListener('pointercancel', endStroke);
+
+window.addEventListener('pointermove', e => {
+  comb.style.left = e.clientX + 'px';
+  comb.style.top = e.clientY + 'px';
+  if (e.pointerType !== 'touch') comb.style.display = 'block';
+});
+window.addEventListener('pointerdown', e => {
+  comb.style.left = e.clientX + 'px';
+  comb.style.top = e.clientY + 'px';
+});
+document.documentElement.addEventListener('pointerleave', e => {
+  if (e.pointerType !== 'touch') comb.style.display = 'none';
+});
+
+death.style.setProperty('--fade', `${DEATH_FADE_MS}ms`);
+enterStart();
+renderScore();
+</script>
+</body>
+</html>
